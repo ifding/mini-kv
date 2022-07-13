@@ -7,7 +7,8 @@ Key-value stores are similar to a hash map (hash table) in most programming lang
 
 Whenever you append a new key-value pair to the file, you also update the hash map to reflect the offset of the data you just wrote (this works both for inserting new keys and for updating existing keys). When you want to look up a value, use the hash map to find the offset in the data file, seek to that location, and read the value. In fact, this is essentially what `Bitcask` does. The values can be loaded from disk with just one disk seek. 
 
-> A storage engine like `Bitcask` is well suited to situations where the value for each key is updated frequently. For example, the key might be the URL of a cat video, and the value might be the number of times it has been played (incremented every time someone hits the play button). In this kind of workload, there are a lot of writes, but there are not too many distinct keys - you have a large number of writes per key, but it's feasible to keep all keys in memory. (From the book `Designing Data-Intensive Applications` by Martin Kleppmann)
+A storage engine like `Bitcask` is well suited to situations where the value for each key is updated frequently. For example, the key might be the URL of a cat video, and the value might be the number of times it has been played (incremented every time someone hits the play button). In this kind of workload, there are a lot of writes, but there are not too many distinct keys - you have a large number of writes per key, but it's feasible to keep all keys in memory. 
+(From the book `Designing Data-Intensive Applications` by Martin Kleppmann)
 
 From the above key-value stores, there are two main tasks we need to solve:
 
@@ -17,3 +18,7 @@ From the above key-value stores, there are two main tasks we need to solve:
 
 ## Encode/Decode data
 
+
+## Reference
+
+- <https://github.com/Morgan279/miniDB>

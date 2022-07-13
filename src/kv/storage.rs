@@ -1,15 +1,24 @@
-use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+use std::convert::TryInto;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
 use serde_repr::*;
-use super::error::{KvError, Result};
 
-const STORAGE_FILE_PREFIX: &str = "miniKV"; 
+use super::error::{KvsError, Result};
+
+const STORAGE_FILE_PREFIX: &str = "miniDB";
 const COMPACTION_THRESHOLD: u64 = 1 << 16;
-const USIZE_LEN : usize = std::mem::size_of::<usize>();
-const ENTRY_HEAD_LEN : usize = USIZE_LEN * 2 + 1;
+const USIZE_LEN: usize = std::mem::size_of::<usize>();
+const ENTRY_HEAD_LEN: usize = USIZE_LEN * 2 + 1;
 
-#[derive(Serialize_repr, Deserialize_repr, Debug, PartialEq)]
+#[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug)]
 #[repr(u8)]
-pub enum CmdType {
+pub enum CmdKind {
     PUT = 1,
     DEL = 2,
 }
@@ -17,20 +26,24 @@ pub enum CmdType {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Entry {
     key_len: usize,
+
     value_len: usize,
+
     key: String,
+
     value: String,
-    cmd_type: CmdType,
+
+    kind: CmdKind,
 }
 
 impl Entry {
-    pub fn new(key: String, value: String, cmd_type: CmdType) -> Entry {
+    pub fn new(key: String, value: String, kind: CmdKind) -> Entry {
         Entry {
-            key_len: key.len(),
-            value_len: value.len(),
-            key: key,
-            value: value,
-            cmd_type: cmd_type,
+            key_len: key.as_bytes().len(),
+            value_len: value.as_bytes().len(),
+            key,
+            value,
+            kind,
         }
     }
 
@@ -40,74 +53,72 @@ impl Entry {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = vec![0; self.size()];
-        // encode key_len
-        buf[0..USIZE_LEN]
-            .copy_from_slice(&self.key_len.to_be_bytes());
+        // encode key len
+        buf[0..USIZE_LEN].copy_from_slice(&self.key_len.to_be_bytes());
 
-        // encode value_len
-        buf[USIZE_LEN..USIZE_LEN * 2]
-            .copy_from_slice(&self.value_len.to_be_bytes());
+        // encode value length
+        buf[USIZE_LEN..USIZE_LEN * 2].copy_from_slice(&self.value_len.to_be_bytes());
 
-        // encode cmd_type
+        // encode kind
         buf[USIZE_LEN * 2..ENTRY_HEAD_LEN]
-            .copy_from_slice(bincode::serialize(&self.cmd_type).unwrap().as_slice());
+            .copy_from_slice(bincode::serialize(&self.kind).unwrap().as_slice());
 
         // encode key
-        buf[ENTRY_HEAD_LEN..ENTRY_HEAD_LEN + self.key_len]
-            .copy_from_slice(self.key.as_bytes());
+        buf[ENTRY_HEAD_LEN..ENTRY_HEAD_LEN + self.key_len].copy_from_slice(self.key.as_bytes());
 
         // encode value
-        buf[ENTRY_HEAD_LEN + self.key_len..]
-            .copy_from_slice(self.value.as_bytes());
+        buf[ENTRY_HEAD_LEN + self.key_len..].copy_from_slice(self.value.as_bytes());
 
         buf
     }
 
-    pub fn decode(buf: &[u8; ENTRY_HEAD_LEN]) -> Result<Entry> {
-        let key_len = usize::from_be_bytes(buf[0..USIZE_LEN].try_into()?);
-        let value_len = usize::from_be_bytes(buf[USIZE_LEN..USIZE_LEN * 2].try_into()?);
-        let cmd_type = bincode::deserialize(&buf[USIZE_LEN * 2..ENTRY_HEAD_LEN])?;
+    pub fn decode(b: &[u8; ENTRY_HEAD_LEN]) -> Result<Entry> {
+        let key_len = usize::from_be_bytes(b[0..USIZE_LEN].try_into()?);
+        let value_len = usize::from_be_bytes(b[USIZE_LEN..USIZE_LEN * 2].try_into()?);
+        let kind: CmdKind = bincode::deserialize(&b[USIZE_LEN * 2..ENTRY_HEAD_LEN])?;
         Ok(Entry {
-            key_len: key_len,
-            value_len: value_len,
+            key_len,
+            value_len,
+            kind,
             key: String::new(),
             value: String::new(),
-            cmd_type: cmd_type,
         })
     }
 }
 
 pub trait Storage {
     fn get(&mut self, key: String) -> Result<Option<String>>;
-    fn set(&mut self, key: String, value: String) -> Result<()>;
+
+    fn put(&mut self, key: String, val: String) -> Result<()>;
+
     fn remove(&mut self, key: String) -> Result<()>;
 }
 
-use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
-use std::io::{Read, Write, Seek, SeekFrom, BufReader, BufWriter};
-use std::collections::HashMap;
 pub struct Bitcask {
-    path_buf: PathBuf,
-    reader: BufReaderPos<File>,
-    writer: BufWriterPos<File>,
+    data_path_buf: PathBuf,
+
+    reader: BufReaderWithPos<File>,
+
+    writer: BufWriterWithPos<File>,
+
     index: HashMap<String, u64>,
-    compaction: u64,
+
+    pending_compact: u64,
 }
 
 impl Storage for Bitcask {
     fn get(&mut self, key: String) -> Result<Option<String>> {
         match self.read(&key) {
-            Ok(entry) => Ok(Some(entry.value)),
-            Err(KvError::KeyNotFound) => Ok(None),
+            Ok(e) => Ok(Some(e.value)),
+            Err(KvsError::KeyNotFound) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    fn set(&mut self, key: String, value: String) -> Result<()> {
-        let entry = Entry::new(key, value, CmdType::PUT);
-        self.write(entry)?;
-        if self.compaction >= COMPACTION_THRESHOLD {
+    fn put(&mut self, key: String, val: String) -> Result<()> {
+        let e = Entry::new(key, val, CmdKind::PUT);
+        self.write(e)?;
+        if self.pending_compact >= COMPACTION_THRESHOLD {
             self.compact()?;
         }
         Ok(())
@@ -115,33 +126,33 @@ impl Storage for Bitcask {
 
     fn remove(&mut self, key: String) -> Result<()> {
         if self.index.contains_key(&key) {
-            let entry = Entry::new(key.clone(), String::new(), CmdType::DEL);
-            self.write(entry)?;
+            let e = Entry::new(key.clone(), String::new(), CmdKind::DEL);
+            self.write(e)?;
             self.index.remove(&key);
             return Ok(());
         }
-        Err(KvError::KeyNotFound)
+
+        Err(KvsError::KeyNotFound)
     }
 }
 
 impl Bitcask {
     pub fn open(path_buf: PathBuf) -> Result<Bitcask> {
-        let data_path = path_buf.join(STORAGE_FILE_PREFIX.to_string() + ".data");
-        let writer = BufWriterPos::new( 
+        let data_path_buf = path_buf.join(STORAGE_FILE_PREFIX.to_string() + ".data");
+        let writer = BufWriterWithPos::new(
             OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true)
-            .open(data_path.as_path())?
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(data_path_buf.as_path())?,
         )?;
-        let reader = BufReaderPos::new(File::open(data_path.as_path())?)?;
-
+        let reader = BufReaderWithPos::new(File::open(data_path_buf.as_path())?)?;
         let mut instance = Bitcask {
-            path_buf: path_buf,
-            reader: reader,
-            writer: writer,
+            data_path_buf,
+            reader,
+            writer,
             index: HashMap::new(),
-            compaction: 0,
+            pending_compact: 0,
         };
         instance.load_index()?;
         Ok(instance)
@@ -149,20 +160,22 @@ impl Bitcask {
 
     fn write(&mut self, entry: Entry) -> Result<()> {
         let key = entry.key.clone();
-        if let Some(pos) = self.index.insert(key, self.writer.pos) {
-            self.compaction += self.read_at(pos).unwrap().size() as u64;
-        } 
+        if let Some(old_pos) = self.index.insert(key, self.writer.pos) {
+            self.pending_compact += self.read_at(old_pos).unwrap().size() as u64;
+        }
         let buf = entry.encode();
         self.writer.write(&buf)?;
         self.writer.flush()?;
         Ok(())
     }
 
-    fn read(&mut self, key:&str) -> Result<Entry> {
+    fn read(&mut self, key: &str) -> Result<Entry> {
         if let Some(offset) = self.index.get(key) {
-            return self.read_at(*offset);
-        }
-        Err(KvError::KeyNotFound)
+            let pos = *offset;
+            return self.read_at(pos);
+        };
+
+        Err(KvsError::KeyNotFound)
     }
 
     fn read_at(&mut self, offset: u64) -> Result<Entry> {
@@ -170,105 +183,111 @@ impl Bitcask {
         let mut buf: [u8; ENTRY_HEAD_LEN] = [0; ENTRY_HEAD_LEN];
         let len = self.reader.read(&mut buf)?;
         if len == 0 {
-            return Err(KvError::EOF);
+            return Err(KvsError::EOF);
         }
-        let mut entry = Entry::decode(&buf)?;
-        let mut key_buf = vec![0; entry.key_len];
+        let mut e = Entry::decode(&buf)?;
+
+        let mut key_buf = vec![0; e.key_len];
         self.reader.read_exact(key_buf.as_mut_slice())?;
-        entry.key = String::from_utf8(key_buf)?;
+        e.key = String::from_utf8(key_buf)?;
 
-        let mut value_buf = vec![0; entry.value_len];
-        self.reader.read_exact(value_buf.as_mut_slice())?;
-        entry.value = String::from_utf8(value_buf)?;
+        let mut val_buf = vec![0; e.value_len];
+        self.reader.read_exact(val_buf.as_mut_slice())?;
+        e.value = String::from_utf8(val_buf)?;
 
-        Ok(entry)
+        Ok(e)
     }
 
     fn load_index(&mut self) -> Result<()> {
         let mut offset = 0;
         loop {
             match self.read_at(offset) {
-                Ok(entry) => {
-                    if entry.cmd_type == CmdType::DEL {
-                        self.index.remove(&entry.key);
+                Ok(e) => {
+                    if e.kind == CmdKind::DEL {
+                        self.index.remove(&e.key);
                         continue;
                     }
-                    let size = entry.size() as u64;
-                    self.index.insert(entry.key, offset);
+                    let size = e.size() as u64;
+                    self.index.insert(e.key, offset);
                     offset += size;
-                },
-                Err(KvError::EOF) => {
+                }
+                Err(KvsError::EOF) => {
                     self.writer.pos = offset;
-                    break;
-                },
-                Err(e) => return Err(e),
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(e);
+                }
             }
         }
-        Ok(())
     }
 
     fn compact(&mut self) -> Result<()> {
-        let mut new_entry = Vec::new();
         let mut offset = 0;
+        let mut valid_entry = Vec::new();
         loop {
             match self.read_at(offset) {
-                Ok(entry) => {
-                    let size = entry.size() as u64;
-                    if let Some(pos) = self.index.get(&entry.key) {
-                        if entry.cmd_type == CmdType::DEL && *pos == offset {
-                            new_entry.push(entry);
+                Ok(e) => {
+                    let size = e.size() as u64;
+                    if let Some(valid_pos) = self.index.get(&e.key) {
+                        if e.kind == CmdKind::PUT && *valid_pos == offset {
+                            valid_entry.push(e);
                         }
                     }
                     offset += size;
-                },
-                Err(KvError::EOF) => break,
-                Err(e) => return Err(e),
+                }
+                Err(KvsError::EOF) => {
+                    break;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
             }
         }
-        if !new_entry.is_empty() {
-            let mut data_buf_ancestors = self.path_buf.ancestors();
-            data_buf_ancestors.next();
-            let new_path_buf = data_buf_ancestors
-                .next()
-                .ok_or(KvError::InvalidDataPath)?
-                .join(STORAGE_FILE_PREFIX.to_string() + ".compact");
-            let mut write_buf = BufWriterPos::new(File::create(new_path_buf.as_path())?)?;
 
-            for entry in &new_entry {
-                let key = entry.key.clone();
+        if !valid_entry.is_empty() {
+            let mut data_path_ancestors = self.data_path_buf.ancestors();
+            data_path_ancestors.next();
+            let merge_path_buf = data_path_ancestors
+                .next()
+                .ok_or(KvsError::InvalidDataPath)?
+                .join(STORAGE_FILE_PREFIX.to_string() + ".merge");
+            let merge_file = File::create(merge_path_buf.as_path())?;
+            let mut write_buf = BufWriterWithPos::new(merge_file)?;
+
+            for e in &valid_entry {
+                let key = e.key.clone();
                 self.index.insert(key, write_buf.pos);
-                write_buf.write(&entry.encode())?;
+                write_buf.write(&e.encode())?;
             }
 
             self.writer = write_buf;
-            self.reader = BufReaderPos::new(File::open(new_path_buf.as_path())?)?;
-            std::fs::remove_file(self.path_buf.as_path())?;
-            std::fs::rename(new_path_buf, self.path_buf.as_path())?;
+            self.reader = BufReaderWithPos::new(File::open(merge_path_buf.as_path())?)?;
+            std::fs::remove_file(self.data_path_buf.as_path())?;
+            std::fs::rename(merge_path_buf.as_path(), self.data_path_buf.as_path())?;
         }
 
-        self.compaction = 0;
+        self.pending_compact = 0;
         Ok(())
     }
 }
 
-use std::io;
-
-struct BufReaderPos<R: Read + Seek> {
+struct BufReaderWithPos<R: Read + Seek> {
     reader: BufReader<R>,
     pos: u64,
 }
 
-impl<R: Read + Seek> BufReaderPos<R> {
-    fn new(mut reader: R) -> Result<Self> {
-        let pos = reader.seek(SeekFrom::Current(0))?;
-        Ok(BufReaderPos {
-            reader: BufReader::new(reader),
-            pos: pos,
+impl<R: Read + Seek> BufReaderWithPos<R> {
+    fn new(mut inner: R) -> Result<Self> {
+        let pos = inner.seek(SeekFrom::Current(0))?;
+        Ok(BufReaderWithPos {
+            reader: BufReader::new(inner),
+            pos,
         })
     }
 }
 
-impl<R: Read + Seek> Read for BufReaderPos<R> {
+impl<R: Read + Seek> Read for BufReaderWithPos<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let len = self.reader.read(buf)?;
         self.pos += len as u64;
@@ -276,29 +295,29 @@ impl<R: Read + Seek> Read for BufReaderPos<R> {
     }
 }
 
-impl<R: Read + Seek> Seek for BufReaderPos<R> {
+impl<R: Read + Seek> Seek for BufReaderWithPos<R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.pos = self.reader.seek(pos)?;
         Ok(self.pos)
     }
 }
 
-struct BufWriterPos<W: Write + Seek> {
+struct BufWriterWithPos<W: Write + Seek> {
     writer: BufWriter<W>,
     pos: u64,
 }
 
-impl<W: Write + Seek> BufWriterPos<W> {
-    fn new(mut writer: W) -> Result<Self> {
-        let pos = writer.seek(SeekFrom::Current(0))?;
-        Ok(BufWriterPos {
-            writer: BufWriter::new(writer),
-            pos: pos,
+impl<W: Write + Seek> BufWriterWithPos<W> {
+    fn new(mut inner: W) -> Result<Self> {
+        let pos = inner.seek(SeekFrom::Current(0))?;
+        Ok(BufWriterWithPos {
+            writer: BufWriter::new(inner),
+            pos,
         })
     }
 }
 
-impl<W: Write + Seek> Write for BufWriterPos<W> {
+impl<W: Write + Seek> Write for BufWriterWithPos<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let len = self.writer.write(buf)?;
         self.pos += len as u64;
@@ -310,7 +329,7 @@ impl<W: Write + Seek> Write for BufWriterPos<W> {
     }
 }
 
-impl<W: Write + Seek> Seek for BufWriterPos<W> {
+impl<W: Write + Seek> Seek for BufWriterWithPos<W> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.pos = self.writer.seek(pos)?;
         Ok(self.pos)

@@ -10,7 +10,7 @@ pub struct KvStore {
 impl KvStore {
     pub fn open(path: &Path) -> Result<KvStore> {
         let storage = Bitcask::open(path.to_path_buf())?;
-        Ok(KvStore { 
+        Ok(KvStore {
             storage: Box::new(storage),
         })
     }
@@ -19,8 +19,8 @@ impl KvStore {
         self.storage.get(key)
     }
 
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        self.storage.set(key, value)
+    pub fn set(&mut self, key: String, val: String) -> Result<()> {
+        self.storage.put(key, val)
     }
 
     pub fn remove(&mut self, key: String) -> Result<()> {
