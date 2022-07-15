@@ -95,7 +95,7 @@ pub trait Storage {
 }
 
 pub struct Bitcask {
-    data_path_buf: PathBuf,
+    path_buf: PathBuf,
 
     reader: BufReaderWithPos<File>,
 
@@ -148,7 +148,7 @@ impl Bitcask {
         )?;
         let reader = BufReaderWithPos::new(File::open(data_path_buf.as_path())?)?;
         let mut instance = Bitcask {
-            data_path_buf,
+            path_buf: data_path_buf,
             reader,
             writer,
             index: HashMap::new(),
@@ -246,7 +246,7 @@ impl Bitcask {
         }
 
         if !valid_entry.is_empty() {
-            let mut data_path_ancestors = self.data_path_buf.ancestors();
+            let mut data_path_ancestors = self.path_buf.ancestors();
             data_path_ancestors.next();
             let merge_path_buf = data_path_ancestors
                 .next()
@@ -263,8 +263,8 @@ impl Bitcask {
 
             self.writer = write_buf;
             self.reader = BufReaderWithPos::new(File::open(merge_path_buf.as_path())?)?;
-            std::fs::remove_file(self.data_path_buf.as_path())?;
-            std::fs::rename(merge_path_buf.as_path(), self.data_path_buf.as_path())?;
+            std::fs::remove_file(self.path_buf.as_path())?;
+            std::fs::rename(merge_path_buf.as_path(), self.path_buf.as_path())?;
         }
 
         self.pending_compact = 0;
