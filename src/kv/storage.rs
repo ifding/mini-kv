@@ -11,7 +11,7 @@ use serde_repr::*;
 
 use super::error::{KvsError, Result};
 
-const STORAGE_FILE_PREFIX: &str = "miniDB";
+const STORAGE_FILE_PREFIX: &str = "miniKV";
 const COMPACTION_THRESHOLD: u64 = 1 << 16;
 const USIZE_LEN: usize = std::mem::size_of::<usize>();
 const ENTRY_HEAD_LEN: usize = USIZE_LEN * 2 + 1;
@@ -173,7 +173,7 @@ impl Bitcask {
         if let Some(offset) = self.index.get(key) {
             let pos = *offset;
             return self.read_at(pos);
-        };
+        }
 
         Err(KvsError::KeyNotFound)
     }
@@ -203,12 +203,12 @@ impl Bitcask {
         loop {
             match self.read_at(offset) {
                 Ok(e) => {
+                    let size = e.size() as u64;  
                     if e.kind == CmdKind::DEL {
                         self.index.remove(&e.key);
-                        continue;
+                    } else {
+                        self.index.insert(e.key, offset);
                     }
-                    let size = e.size() as u64;
-                    self.index.insert(e.key, offset);
                     offset += size;
                 }
                 Err(KvsError::EOF) => {
@@ -230,6 +230,7 @@ impl Bitcask {
                 Ok(e) => {
                     let size = e.size() as u64;
                     if let Some(valid_pos) = self.index.get(&e.key) {
+                        // valid entry needs to meet the following conditions:
                         if e.kind == CmdKind::PUT && *valid_pos == offset {
                             valid_entry.push(e);
                         }
@@ -248,12 +249,12 @@ impl Bitcask {
         if !valid_entry.is_empty() {
             let mut data_path_ancestors = self.path_buf.ancestors();
             data_path_ancestors.next();
-            let merge_path_buf = data_path_ancestors
+            let compact_path_buf = data_path_ancestors
                 .next()
                 .ok_or(KvsError::InvalidDataPath)?
-                .join(STORAGE_FILE_PREFIX.to_string() + ".merge");
-            let merge_file = File::create(merge_path_buf.as_path())?;
-            let mut write_buf = BufWriterWithPos::new(merge_file)?;
+                .join(STORAGE_FILE_PREFIX.to_string() + ".compact");
+            let compact_file = File::create(compact_path_buf.as_path())?;
+            let mut write_buf = BufWriterWithPos::new(compact_file)?;
 
             for e in &valid_entry {
                 let key = e.key.clone();
@@ -262,9 +263,9 @@ impl Bitcask {
             }
 
             self.writer = write_buf;
-            self.reader = BufReaderWithPos::new(File::open(merge_path_buf.as_path())?)?;
+            self.reader = BufReaderWithPos::new(File::open(compact_path_buf.as_path())?)?;
             std::fs::remove_file(self.path_buf.as_path())?;
-            std::fs::rename(merge_path_buf.as_path(), self.path_buf.as_path())?;
+            std::fs::rename(compact_path_buf.as_path(), self.path_buf.as_path())?;
         }
 
         self.pending_compact = 0;

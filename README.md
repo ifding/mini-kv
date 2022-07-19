@@ -19,6 +19,9 @@ From the above key-value stores, there are two main tasks we need to solve:
 - The In-memory hash map contains `key` and `byte offset`, how to write/read the key-value pairs into the log-structured file on the disk. We need to encode/decode the data.
 - How do we avoid eventually running out of disk space? We need to perform _compaction_ to throw away duplicate keys in the log, and keeping only the most recent update for each key.
 
+More details: [Bitcask: A Log-Structured Hash Table for Fast Key/Value Data](resources/bitcask-intro.pdf)
+
+
 ## Overview
 
 ![](resources/mini-kv.jpg)
@@ -60,6 +63,25 @@ clap = { version = "3.1", features = ["derive"] }
 thiserror = "1.0"
 serde = { version = "1.0.137", features = ["derive"] }
 serde_repr = "0.1.8"
+```
+
+## Commands 
+
+```
+kvs 0.1.0
+
+USAGE:
+    kvs <SUBCOMMAND>
+
+OPTIONS:
+    -h, --help       Print help information
+    -V, --version    Print version information
+
+SUBCOMMANDS:
+    get     get <KEY>
+    help    Print this message or the help of the given subcommand(s)
+    rm      rm <KEY>
+    set     set <KEY> <VALUE>
 ```
 
 
